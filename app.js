@@ -2,9 +2,9 @@
 const stage=document.getElementById('stage'), cursor=document.getElementById('cursor'), touch=document.getElementById('touch');
 const mobile=matchMedia('(pointer:coarse)').matches;
 document.body.classList.toggle('mobile',mobile);
-const pieces={fable:['Willow','Movement parts the threads. Touch plucks them.'],liquid:['Liquid Paint','Touch and drag to paint flowing colour.'],haiku:['Starwell','Touch to gather the stars. Release to let them drift.']};
+const pieces={fable:['Willow','Presence displaces strands. Contact applies an impulse.'],liquid:['Liquid Paint','Hold contact and drag to inject colour into the fluid.'],haiku:['Starwell','Contact attracts particles. Release restores free motion.']};
 let current='fable', moveId=null, pressId=null, keyPress=false, mousePress=false, started=false;
-if(mobile){document.getElementById('welcome').textContent='Drag a finger to move your hand. Hold Touch with your other thumb to press against the wall.';document.getElementById('hint').textContent='Drag to move · hold Touch to press';}
+if(mobile){document.getElementById('welcome').textContent='Drag to position the simulated hand. Hold Touch with a second finger to activate contact.';document.getElementById('hint').textContent='Drag = position · hold Touch = contact';}
 function drawCursor(){const i=WallKit.input;cursor.style.display=i.present?'block':'none';cursor.style.transform=`translate(${i.x*innerWidth}px,${i.y*innerHeight}px)`;cursor.classList.toggle('pressing',i.pressed);touch.setAttribute('aria-pressed',String(i.pressed));}
 function update(){WallKit.input.pressed=mousePress||keyPress||pressId!==null;drawCursor();}
 function position(e){Object.assign(WallKit.input,{x:Math.max(0,Math.min(1,e.clientX/innerWidth)),y:Math.max(0,Math.min(1,e.clientY/innerHeight)),present:true});drawCursor();}

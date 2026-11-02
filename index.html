@@ -1,13 +1,13 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; worker-src 'self'; object-src 'none'; base-uri 'none'">
-<meta name="theme-color" content="#090c15"><link rel="manifest" href="manifest.webmanifest"><link rel="icon" href="icon.svg" type="image/svg+xml"><link rel="stylesheet" href="style.css"><title>Touch Wall · Playground</title></head>
-<body><main id="stage" tabindex="0" aria-label="Interactive Touch Wall. Move to hover. Click or hold Space to touch."></main>
-<header><a class="brand" href="./">TOUCH WALL <span>PLAYGROUND</span></a><span class="badge">Interactive demo</span></header>
+<meta name="theme-color" content="#090c15"><link rel="manifest" href="manifest.webmanifest"><link rel="icon" href="icon.svg" type="image/svg+xml"><link rel="stylesheet" href="style.css"><title>Touch Wall · Beta</title></head>
+<body><main id="stage" tabindex="0" aria-label="Touch Wall input simulation. Move for presence. Hold click or Space for contact."></main>
+<header><a class="brand" href="./">TOUCH WALL <span>BETA</span></a><span class="badge">Input simulator</span></header>
 <div id="cursor" aria-hidden="true"><span></span></div>
-<section id="intro"><p class="eyebrow">A little piece of the wall.</p><h1>Move through light.</h1><p id="welcome">Move your mouse to stir the scene. Click and hold to touch.</p><button id="start">Try the wall <span>↗</span></button><p class="note">Runs here on your device. No camera or sensor needed.</p></section>
-<footer><div class="info"><h2 id="piece-name">Willow</h2><p id="piece-help">Movement parts the threads. Touch plucks them.</p></div>
+<section id="intro"><p class="eyebrow">Public beta · Experimental</p><h1>Interaction test.</h1><p id="welcome">Move the pointer to simulate presence. Hold click or Space to simulate contact.</p><button id="start">Start test <span>↗</span></button><p class="note">Local rendering · Simulated input · No sensors required.</p></section>
+<footer><div class="info"><h2 id="piece-name">Willow</h2><p id="piece-help">Presence displaces strands. Contact applies an impulse.</p></div>
 <nav aria-label="Choose an effect"><button data-piece="fable" aria-pressed="true"><i class="willow"></i>Willow</button><button data-piece="liquid" aria-pressed="false"><i class="paint"></i>Liquid Paint</button><button data-piece="haiku" aria-pressed="false"><i class="stars"></i>Starwell</button></nav>
-<div class="controls"><p id="hint">Move to hover · hold click or Space to touch</p><button id="touch" aria-label="Hold to touch the wall" aria-pressed="false">Touch <span>◎</span></button><button id="reset" aria-label="Restart this effect">Reset</button></div></footer>
+<div class="controls"><p id="hint">Pointer = presence · click / Space = contact</p><button id="touch" aria-label="Hold to activate simulated contact" aria-pressed="false">Touch <span>◎</span></button><button id="reset" aria-label="Restart this effect">Reset</button></div></footer>
 <div id="error" role="alert" hidden></div>
 <script src="host.js"></script><script src="effects/synth-depth.js"></script><script src="effects/fable.js"></script><script src="effects/liquid.js"></script><script src="effects/haiku.js"></script><script src="app.js"></script></body></html>
