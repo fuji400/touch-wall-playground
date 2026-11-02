@@ -11,6 +11,7 @@ var WallKit = (() => {
   let depthWanted = false, lastDepth = 0, contact = null;
   function stop() {
     const a = active; active = null; contact = null; depthWanted = false;
+    window.WallWake?.setRunning(false);
     if (!a) return;
     cancelAnimationFrame(a.raf);
     try { a.inst?.destroy?.(); } catch(error) { console.error(error); } finally {
@@ -80,7 +81,7 @@ var WallKit = (() => {
       toScreen:(u,v)=>[u/512,v/424],fromScreen:(x,y)=>[x*512,y*424],size:()=>[canvas.width,canvas.height],
       room:()=>({enabled:false,fresh:false,present:false,motion:0}),music:()=>WallAudio.read(musicEnabled,musicAmount),log:()=>{}};
     active=a; document.getElementById('stage').append(canvas); resize(a);
-    try { a.inst=WallPlugins[id].create(canvas,a.kit); a.raf=requestAnimationFrame(loop); return true; }
+    try { a.inst=WallPlugins[id].create(canvas,a.kit); a.raf=requestAnimationFrame(loop); window.WallWake?.setRunning(true); return true; }
     catch(error) { fail(error); return false; }
   }
   return {start,stop,input,setMusic:(enabled,amount)=>{musicEnabled=!!enabled;musicAmount=Math.max(0,Math.min(1,amount));},activeId:()=>active?.id,instance:()=>active?.inst,

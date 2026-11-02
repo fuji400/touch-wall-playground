@@ -18,7 +18,7 @@ function drawCursor(){const i=WallKit.input;cursor.style.display=i.present?'bloc
 function update(){WallKit.input.pressed=mousePress||keyPress||pressId!==null;drawCursor();}
 function position(e){Object.assign(WallKit.input,{x:Math.max(0,Math.min(1,e.clientX/innerWidth)),y:Math.max(0,Math.min(1,e.clientY/innerHeight)),present:true});drawCursor();}
 function clear(){moveId=null;pressId=null;keyPress=false;mousePress=false;Object.assign(WallKit.input,{pressed:false,present:false});drawCursor();}
-function begin(){started=true;$('intro').hidden=true;stage.focus({preventScroll:true});}
+function begin(){started=true;WallWake.setStarted(true);$('intro').hidden=true;stage.focus({preventScroll:true});}
 $('start').addEventListener('click',begin);
 stage.addEventListener('pointerdown',e=>{if(!started)begin();if(moveId!==null)return;if(e.pointerType==='mouse'&&e.button!==0)return;e.preventDefault();moveId=e.pointerId;stage.setPointerCapture(e.pointerId);position(e);mousePress=e.pointerType==='mouse'||e.pointerType==='pen';update();});
 stage.addEventListener('pointermove',e=>{if(!started)return;if(e.pointerType==='mouse'||e.pointerId===moveId)position(e);});
@@ -100,6 +100,9 @@ $('mic').addEventListener('click',()=>WallAudio.microphone());$('audio-file').ad
 $('sensitivity').addEventListener('input',e=>{WallAudio.setSensitivity(e.target.value);$('sensitivity-value').value=format(Number(e.target.value))+'×';});
 function audioUI(){const a=WallAudio.status();$('audio-status').textContent=a.message;$('stop-audio').disabled=a.mode==='off';$('resume-audio').hidden=a.mode==='off'||a.active||a.pending;$('audio-indicator').textContent=a.active?(a.mode==='mic'?'MIC ACTIVE':'AUDIO FILE'):a.pending?'MIC PERMISSION':a.mode==='off'?'AUDIO OFF':'AUDIO PAUSED';$('audio-indicator').classList.toggle('live',a.active);for(const [i,key]of ['bass','mid','high'].entries())$(key).value=a.bands[i];}
 window.addEventListener('wall-audio',audioUI);window.addEventListener('wall-frame',audioUI);
+function wakeUI(){const s=WallWake.status();$('keep-awake').checked=s.enabled;$('wake-status').textContent=s.message;$('retry-wake').hidden=!s.enabled||!s.running||!s.started||!['denied','released'].includes(s.state);}
+$('keep-awake').addEventListener('change',e=>WallWake.setEnabled(e.target.checked));$('retry-wake').addEventListener('click',()=>WallWake.retry());window.addEventListener('wall-wake',wakeUI);wakeUI();
+
 // Stable public API also permits deterministic offline smoke tests without live wall services.
 window.TouchWallDemo={select,current:()=>current,state,applyParameters,ready:select('fable')};renderLibrary();audioUI();
 if('serviceWorker' in navigator&&(location.protocol==='https:'||location.hostname==='localhost'||location.hostname==='127.0.0.1'))navigator.serviceWorker.register('./sw.js').catch(()=>{});
