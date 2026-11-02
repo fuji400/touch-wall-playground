@@ -1,0 +1,17 @@
+{
+  "name": "starrynight",
+  "author": "Codex for Billy",
+  "construction": "authored triangle forms and independent tapered ribbon meshes; no image input",
+  "size": [
+    1280,
+    800
+  ],
+  "stride": 9,
+  "vertices": 717681,
+  "counts": {
+    "ribbons": 49022,
+    "stars": 12,
+    "stable_village_houses": 90
+  },
+  "groups": []
+}

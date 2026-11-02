@@ -1,0 +1,95 @@
+/* Eclipse Duet — original geometric alignment preview, astronomically inspired.
+ * Reachable sun at y=.65. One moon reveals a corona; two nearby aligned contacts
+ * build a shared blossom. No skeleton or persistent person identity is assumed.
+ */
+(function(){
+  'use strict';
+  var finite=Number.isFinite,TAU=Math.PI*2;
+  function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
+  function valid(p){return Array.isArray(p)&&finite(p[0])&&finite(p[1])&&p[0]>=0&&p[0]<=1&&p[1]>=0&&p[1]<=1;}
+  // Exact circle intersection area, including containment and disjoint cases.
+  function overlap(r,R,d){if(!finite(r)||!finite(R)||!finite(d)||r<=0||R<=0||d<0)return 0;
+    if(d>=r+R)return 0;if(d<=Math.abs(R-r))return Math.PI*Math.min(r,R)*Math.min(r,R);
+    var a=Math.acos(clamp((d*d+r*r-R*R)/(2*d*r),-1,1)),b=Math.acos(clamp((d*d+R*R-r*r)/(2*d*R),-1,1));
+    return r*r*a+R*R*b-.5*Math.sqrt(Math.max(0,(-d+r+R)*(d+r-R)*(d-r+R)*(d+r+R)));}
+  registerWallPlugin({id:'eclipseduet',title:'Eclipse Duet',author:'Codex',create:create});
+  function create(canvas,kit){
+    var g=canvas.getContext('2d');if(!g)throw Error('Eclipse Duet needs Canvas2D');
+    var body=window.WallBody?WallBody.create(kit):null,cfg={orbit:30,size:50,corona:60,hue:0};
+    var room={motion:0};
+    var dead=false,age=0,moons=[],wakes=[],nextId=1,coverage=0,corona=0,pair=0,aligned=false,bodyBend=0;
+    var sun={x:640,y:520,r:110},width=1280,height=800;
+    function set(o){if(o&&!dead)Object.keys(cfg).forEach(function(k){if(finite(o[k]))cfg[k]=clamp(o[k],0,k==='hue'?360:100);});return Object.assign({},cfg);}
+    function wake(x,y){if(dead||!valid([x,y]))return;var f=kit.fingers,fa=f?Date.now()-f.t:Infinity;if(f&&finite(f.t)&&fa>=-34&&fa<=250){wakes=[];return;}var now=Date.now(),old=wakes.find(function(p){return Math.hypot(p.x-x,p.y-y)<.025;});
+      if(old){old.x=x;old.y=y;old.until=now+350;}else{if(wakes.length>=2)wakes.shift();wakes.push({x:x,y:y,until:now+350});}}
+    function contacts(){var t=Date.now(),f=kit.fingers,raw;wakes=wakes.filter(function(p){return p.until>t;});
+      if(f&&finite(f.t)&&t-f.t>=-34&&t-f.t<=250){wakes=[];raw=Array.isArray(f.pts)?f.pts:[];}else raw=wakes.map(function(p){return[p.x,p.y];});
+      var pts=[];raw.slice(0,32).filter(valid).sort(function(a,b){return a[0]-b[0]||a[1]-b[1];}).forEach(function(p){if(pts.length<2&&!pts.some(function(q){return Math.hypot(p[0]-q[0],p[1]-q[1])<.015;}))pts.push([p[0],p[1]]);});return pts;}
+    function update(pts,dt){
+      room=kit.room?kit.room(dt):{motion:0};
+      var edges=[];moons.forEach(function(m,mi){pts.forEach(function(p,pi){var d=Math.hypot(m.x-p[0],m.y-p[1]);if(d<.22)edges.push({mi:mi,pi:pi,d:d});});});
+      edges.sort(function(a,b){return a.d-b.d||moons[a.mi].id-moons[b.mi].id||a.pi-b.pi;});
+      var usedM={},usedP={},next=[];edges.forEach(function(e){if(usedM[e.mi]||usedP[e.pi])return;usedM[e.mi]=usedP[e.pi]=true;var m=moons[e.mi],p=pts[e.pi];m.x=p[0];m.y=p[1];next.push(m);});
+      pts.forEach(function(p,pi){if(!usedP[pi])next.push({id:nextId++,x:p[0],y:p[1],px:p[0]*1280,py:p[1]*800,coverage:0});});
+      moons=next.sort(function(a,b){return a.id-b.id;});sun.r=80+cfg.size*.60;coverage=0;
+      moons.forEach(function(m){var px=m.x*1280,py=m.y*800,d=Math.hypot(px-sun.x,py-sun.y);
+        // A small capture zone makes totality achievable with noisy fingertips.
+        if(d<sun.r*.17){px=sun.x;py=sun.y;}
+        var k=1-Math.exp(-dt*18);m.px+=(px-m.px)*k;m.py+=(py-m.py)*k;
+        m.coverage=clamp(overlap(sun.r,sun.r*1.035,Math.hypot(m.px-sun.x,m.py-sun.y))/(Math.PI*sun.r*sun.r),0,1);coverage=Math.max(coverage,m.coverage);
+      });
+      var sep=moons.length===2?Math.hypot(moons[0].px-moons[1].px,moons[0].py-moons[1].py):0;
+      aligned=moons.length===2&&Math.min(moons[0].coverage,moons[1].coverage)>.56&&sep>sun.r*.25&&sep<sun.r*1.05;
+      pair=clamp(pair+dt*(aligned?.65:-.50),0,1);corona+=(coverage-corona)*(1-Math.exp(-dt*9));
+      var target=0;if(body&&body.fresh&&body.regOk&&body.present){target=clamp((finite(body.meanGap)?body.meanGap:0)/1500,0,1)*.7;body.people.slice(0,4).forEach(function(p){target+=finite(p.moving)?clamp(p.moving,0,1)*.12:0;});}
+      target+=room.motion*.7;
+      bodyBend+=(target-bodyBend)*(1-Math.exp(-dt*5));
+    }
+    function color(h,s,l,a){return 'hsla('+((h+cfg.hue)%360)+','+s+'%,'+l+'%,'+a+')';}
+    function disk(x,y,r){g.beginPath();g.arc(x,y,r,0,TAU);g.fill();}
+    function ring(x,y,r){g.beginPath();g.arc(x,y,r,0,TAU);g.stroke();}
+    function render(){
+      if(!finite(canvas.width)||!finite(canvas.height)||canvas.width<=0||canvas.height<=0)return;
+      g.setTransform(canvas.width/1280,0,0,canvas.height/800,0,0);g.globalAlpha=1;
+      var bg=g.createLinearGradient(0,0,0,800);bg.addColorStop(0,color(228,52,4,1));bg.addColorStop(.68,color(229,40,9,1));bg.addColorStop(1,color(240,38,5,1));g.fillStyle=bg;g.fillRect(0,0,1280,800);
+      for(var s=0;s<100;s++){var sx=25+(s*397.37)%1230,sy=20+(s*173.97)%727;g.fillStyle=color(216,35,81,.14+.10*Math.sin(s+age*.17));disk(sx,sy,s%13===0?1.6:.7);}
+      // Quiet celestial guides make the single low sun feel intentional at idle.
+      g.strokeStyle=color(222,28,61,.13);g.lineWidth=1;
+      [182,263,350].forEach(function(r){g.beginPath();g.ellipse(sun.x,sun.y,r,r*.64,-.21,0,TAU);g.stroke();});
+      var orbitAngle=age*(.018+cfg.orbit*.0018)-2.0;
+      for(var j=0;j<3;j++){var a=orbitAngle+j*2.06,r=182+j*87;var ox=sun.x+Math.cos(a)*r,oy=sun.y+Math.sin(a)*r*.64;g.fillStyle=color(35+j*40,40,69,.7);disk(ox,oy,2.4);}
+      var energy=.13+corona*(.45+cfg.corona*.006)+room.motion*.32,halo=g.createRadialGradient(sun.x,sun.y,sun.r*.80,sun.x,sun.y,sun.r*3.15);
+      halo.addColorStop(0,color(38,90,71,energy*.56));halo.addColorStop(.24,color(29,78,56,energy*.32));halo.addColorStop(1,color(30,70,28,0));g.fillStyle=halo;g.fillRect(sun.x-sun.r*3.2,sun.y-sun.r*3.2,sun.r*6.4,sun.r*6.4);
+      // 96 analytic rays: fixed work, no feedback textures and no flashing threshold.
+      g.strokeStyle=color(39,75,80,.12+corona*.65);g.lineWidth=1.3;g.beginPath();
+      for(var i=0;i<96;i++){var a=i*TAU/96,noise=.55+.3*Math.sin(i*3.73)+.15*Math.cos(i*1.91+age*.24);
+        var bend=bodyBend*.11*Math.sin(a*2+age*.3),inner=sun.r*1.005,outer=sun.r*(1.12+energy*(.40+noise*.75));
+        g.moveTo(sun.x+Math.cos(a)*inner,sun.y+Math.sin(a)*inner);g.quadraticCurveTo(sun.x+Math.cos(a+bend*.5)*(inner+outer)*.5,sun.y+Math.sin(a+bend*.5)*(inner+outer)*.5,sun.x+Math.cos(a+bend)*outer,sun.y+Math.sin(a+bend)*outer);
+      }g.stroke();
+      if(pair>.001){g.strokeStyle=color(185,50,78,pair*.60);g.lineWidth=1.5;
+        for(var p=0;p<12;p++){var a=p*TAU/12+age*.015,rr=sun.r*(1.6+pair*.70);g.beginPath();g.ellipse(sun.x+Math.cos(a)*rr*.53,sun.y+Math.sin(a)*rr*.53,rr*.63,sun.r*.18,a,0,TAU);g.stroke();}
+        g.strokeStyle=color(42,76,85,pair*.75);g.lineWidth=1;ring(sun.x,sun.y,sun.r*(2.25+pair*.2));
+      }
+      var sunPaint=g.createRadialGradient(sun.x-25,sun.y-30,5,sun.x,sun.y,sun.r);sunPaint.addColorStop(0,color(48,90,83,1));sunPaint.addColorStop(.8,color(35,84,62,1));sunPaint.addColorStop(1,color(26,72,43,1));g.fillStyle=sunPaint;disk(sun.x,sun.y,sun.r);
+      // Slow fine solar texture; clipped to the sun and entirely beneath the moons.
+      g.save();g.beginPath();g.arc(sun.x,sun.y,sun.r,0,TAU);g.clip();g.strokeStyle=color(25,53,35,.14);g.lineWidth=1;
+      for(var line=0;line<13;line++){var yy=sun.y-sun.r+line*sun.r/6;g.beginPath();g.moveTo(sun.x-sun.r,yy);g.bezierCurveTo(sun.x-sun.r*.4,yy+9*Math.sin(age*.1+line),sun.x+sun.r*.4,yy-7,sun.x+sun.r,yy+2);g.stroke();}g.restore();
+      // Idle crescent waits beside the target, visibly hinting at alignment.
+      if(!moons.length){var mx=sun.x-247,my=sun.y-56+Math.sin(orbitAngle)*14;g.fillStyle=color(217,23,54,.60);disk(mx,my,33);g.fillStyle=color(229,42,8,1);disk(mx+11,my-5,32);g.strokeStyle=color(223,24,51,.15);g.lineWidth=1;g.beginPath();g.moveTo(mx+45,my+6);g.quadraticCurveTo(506,490,518,520);g.stroke();}
+      moons.forEach(function(m,idx){var mr=sun.r*1.035;g.fillStyle=color(227,38,5,1);disk(m.px,m.py,mr);
+        var moonPaint=g.createRadialGradient(m.px-mr*.4,m.py-mr*.4,1,m.px,m.py,mr);moonPaint.addColorStop(0,color(225,27,14,.58));moonPaint.addColorStop(1,color(227,30,5,0));g.fillStyle=moonPaint;disk(m.px,m.py,mr);
+        g.strokeStyle=color(idx?184:36,55,77,.33+m.coverage*.28);g.lineWidth=1.2;ring(m.px,m.py,mr);
+        g.fillStyle=color(idx?184:36,62,80,.55);disk(m.px,m.py,2.2);
+      });
+      // Crown remains readable at totality; it is revealed outside the occulting disks.
+      if(corona>.92){g.strokeStyle=color(42,84,90,(corona-.92)*10);g.lineWidth=2;ring(sun.x,sun.y,sun.r*1.055);}
+      if(aligned){g.strokeStyle=color(187,62,83,.28+pair*.45);g.lineWidth=1;g.beginPath();g.moveTo(moons[0].px,moons[0].py);g.lineTo(moons[1].px,moons[1].py);g.stroke();}
+    }
+    function resize(w,h){if(finite(w)&&finite(h)&&w>0&&h>0){width=w;height=h;}}
+    function frame(dt,now){if(dead)return;dt=finite(dt)?clamp(dt,0,.08):0;now=finite(now)?now:performance.now();age+=dt;if(body)body.update(dt,now);update(contacts(),dt);render();}
+    function debug(){return {sun:Object.assign({},sun),moons:moons.map(function(m){return Object.assign({},m);}),coverage:coverage,corona:corona,pair:pair,aligned:aligned,bodyBend:bodyBend,wakes:wakes.length,settings:set(),dead:dead,size:[width,height],finite:[coverage,corona,pair,bodyBend].every(finite)&&moons.every(function(m){return [m.px,m.py,m.coverage].every(finite);})};}
+    function destroy(){if(dead)return;dead=true;moons=[];wakes=[];body=null;if(window.EclipseduetSet===set)delete window.EclipseduetSet;if(window.EclipseduetWake===wake)delete window.EclipseduetWake;kit.wantDepth(false);}
+    window.EclipseduetSet=set;window.EclipseduetWake=wake;if(window._eclipseduetFx)set(window._eclipseduetFx);resize(canvas.width,canvas.height);kit.wantDepth(true);
+    return {frame:frame,touch:function(t){if(t)wake(t.x,t.y);},resize:resize,destroy:destroy,debug:debug};
+  }
+})();

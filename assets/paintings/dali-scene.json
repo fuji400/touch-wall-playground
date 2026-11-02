@@ -1,0 +1,50 @@
+{
+  "name": "dali",
+  "size": [
+    1280,
+    800
+  ],
+  "stride": 9,
+  "vertices": 1034595,
+  "groups": [
+    {
+      "pivot": [
+        0,
+        0
+      ],
+      "parent": 0
+    },
+    {
+      "pivot": [
+        0,
+        0
+      ],
+      "parent": 0
+    },
+    {
+      "pivot": [
+        0,
+        0
+      ],
+      "parent": 0
+    },
+    {
+      "pivot": [
+        0,
+        0
+      ],
+      "parent": 0
+    },
+    {
+      "pivot": [
+        0,
+        0
+      ],
+      "parent": 0
+    }
+  ],
+  "counts": {
+    "ribbons": 1490
+  },
+  "construction": "authored coastal landscape, modeled profile and deformable watch surfaces; reference pixels never sampled"
+}

@@ -1,0 +1,750 @@
+/* Frost Window — stay still and frost grows out from you (2026-10-05; fx-research concept #4, built by Claude (fx-batch)).
+ *
+ * A dark window at night, a blurred city glowing far behind the glass. Stand still in front of it and frost ferns grow out of
+ * your outline across the glass: stems that throw side branches at ice's 60 degrees, faster and further the longer you stay.
+ * Two still people's frost grows into each other and knits together. Move and your warmth melts the frost near you into
+ * drops that run down the glass, cutting clear tracks. Walk away and the frost stays, with a clear person-shaped hole in it;
+ * it glows less once nobody feeds it and slowly thaws. A fingertip draws a clear wet line through the frost, beads along it.
+ * With nobody there, faint frost creeps in from the window's edges and corners and slowly melts back.
+ * Nothing is projected inside a person (DARK_INSIDE); a thin condensation mist hugs the outline the moment someone arrives.
+ *
+ * How: the crystals are grown by CPU "tips" (each a growing branch end: position, heading, speed, generation) that branch as
+ * they go; every frame each tip lays a short tapered segment into a GPU deposit target (MAX blend). One GPU pass folds the
+ * deposit into the frost state (half the picture's resolution: ice, freshness, mist, wet), thaws it, melts it where people
+ * moved and erases it where drops ran or a finger wiped. A blurred copy gives the glow; the last pass draws the glass.
+ * A coarse CPU grid mirrors the ice, so tips stop where they meet other frost (ferns interlock) and melting knows where
+ * to start drops.
+ * Body: plugins/body.js (WallBody). Beyond the stage, this piece computes (CPU, per depth frame, 128 x 106): a people-only
+ * mask (only blobs the stage counts as people, so Kinect noise never mists or melts anything), a heat map (the stage's
+ * motion, only near people, blurred ~2 cells) and a reach map (each still person's reach carried outward from their cells
+ * by a max-chamfer, so frost only grows as far from you as your stillness has earned).
+ * WebGL 2 + EXT_color_buffer_float, no assets, no audio, one depth client (via the host).
+ */
+(function () {
+  'use strict';
+
+  // ---------------------------------------------------------------- tuning knobs
+  // (px = pixels on a 1280-wide picture; cells = Kinect body cells, about 10 px on this wall)
+  var GROW_START = 75;       // how fast a fern grows when you have just become still (px per second)
+  var GROW_MAX = 190;        // ...and once you have stayed still a while
+  var GROW_RAMP_S = 8;       // seconds of stillness to get (most of the way) from GROW_START to GROW_MAX
+  var REACH_START = 8;       // how far from your outline frost may grow when you have just become still (cells)
+  var REACH_MAX = 25;        // the furthest it ever reaches from one person (cells) - one person never frosts the whole wall
+  var RAGGED = 7;            // ferns stop up to this much short of the reach, so the frost's edge is ragged, not a halo (cells)
+  var REACH_RAMP_S = 14;     // seconds of stillness to get (most of the way) to REACH_MAX
+  var STILL_GRACE_S = 0.12;  // stillness needed before the first crystals start (s)
+  var CHILL_LOSS = 2.0;      // moving spends your stillness this many times faster than standing earns it
+  var SETTLE_MOVE = 0.08;    // movement below this (share of you changing) only pauses the frost, it does not spend it
+  var ROOTS_PER_S = 20;      // new ferns started per second along a still adult's outline (while there is room)
+  var ROOT_GAP = 20;         // a new fern never starts closer than this to existing frost (px)
+  var ROOT_JITTER = 0.45;    // how far a fern's first heading strays from straight out of your outline (radians)
+  var BARB_EVERY = 6;        // px between the barbs along a stem (a frost fern is a stem feathered with short barbs)
+  var BARB_LEN = 22;         // longest barb (px); barbs get shorter toward the end of a fern's reach
+  var BARB_ANGLE = 60;       // degrees between a stem and its barbs (ice is hexagonal)
+  var PAIRED = 0.5;          // chance barbs come in opposite pairs (the rest alternate sides)
+  var FORK = 0.08;           // chance, at each barb, that the stem also forks into a new stem (how bushy the frost gets)
+  var FORK_ANGLE = 42;       // degrees a fork turns away from its stem
+  var TWIG = 0.35;           // chance a barb grows one small twig of its own
+  var STEM_PX = 2.6;         // stem half-width (px); branches and twigs are thinner
+  var CURL = 0.5;            // how much stems bend as they grow (radians per 100 px)
+  var MAX_TIPS = 2600;       // growing crystal tips at once, everyone together
+  var OWNER_SHARE = 0.6;     // ...and the most of those one person may have
+  var FRESH_TAU = 0.8;       // seconds for frost to dim to its resting glow once nobody still is near it
+  var REST_GLOW = 0.13;      // brightness of frost nobody is feeding (share of full)
+  var REST_CAP = 0.145;      // the brightest any glass nobody feeds may get (share of full; 0.145 = 37 of 255)
+  var THAW_S = 45;           // seconds for unfed frost to thaw away completely
+  var MELT_S = 0.3;          // seconds for frost to melt next to a moving person
+  var HEAT_GAIN = 2.6;       // how strongly movement warms the glass around it
+  var DROPS_MAX = 45;        // running drops at once
+  var DROP_CHANCE = 0.05;    // chance a melting bit of frost turns into a drop
+  var DROP_SPEED = 80;       // px per second a sliding drop moves
+  var DROP_DIM = 0.13;       // brightness of a drop far from anyone (share of full)
+  var WIPE_PX = 11;          // half-width of the clear line a fingertip draws (px)
+  var WET_S = 7;             // seconds a wiped line stays wet (frost cannot grow into it meanwhile)
+  var RIM = 0.55;            // brightness of the condensation mist that hugs a person's outline at once
+  var HAZE = 0.32;           // milky frost haze that builds up between ferns around a still person
+  var EDGE_REACH = 64;       // idle frost on the window's edges: how far in it reaches (px; corners reach ~2.5x this)
+  var EDGE_CORNER = 0.22;    // how big the frosty corners are (share of the picture's height)
+  var EDGE_PERIOD_S = 80;    // idle frost creeps in and melts back over this many seconds
+  var EDGE_SPEED = 22;       // px per second the idle edge frost grows
+  var EDGE_ROOTS_S = 5;      // new edge ferns per second (while there is room)
+  var EDGE_TIPS = 500;       // most growing tips the idle edge frost may have
+  var CITY = 1.0;            // brightness of the blurred night city behind the glass
+  var SPARKLE = 1.0;         // glints on freshly grown frost
+  var DARK_INSIDE = 1.0;     // no light inside a person (1 = none, 0 = off)
+
+  registerWallPlugin({id: 'frostwindow', title: 'Frost Window', author: 'Claude (fx-batch), fx-research concept #4', create: create});
+
+  var STALE_HOLD_MS = 300, GEN_SPEED = [1, 0.72, 0.55], GEN_W = [1, 0.62, 0.45], GEN_ICE = [1, 0.66, 0.5], STALL_S = 6, LOOK = 2.6, CHILL_CAP = 30;
+
+  var VS = '#version 300 es\nout vec2 vUv;\nvoid main(){vec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));vUv=p;gl_Position=vec4(p*2.-1.,0.,1.);}\n';
+
+  // one capsule per instance (sim px, y down): crystal segments, finger wipes and drop tracks, MAX-blended into the deposit
+  var SEG_VS = '#version 300 es\n' +
+    'layout(location=0) in vec4 aSeg; layout(location=1) in vec4 aVal; uniform vec2 uSim;\n' +
+    'flat out vec4 vSeg; flat out vec4 vVal;\n' +
+    'void main(){ int i=gl_VertexID; vec2 c=vec2((i==1||i==2||i==4)?1.:0.,(i==2||i==4||i==5)?1.:0.);\n' +
+    '  float r=aVal.x+3.; vec2 lo=min(aSeg.xy,aSeg.zw)-r, hi=max(aSeg.xy,aSeg.zw)+r, q=mix(lo,hi,c);\n' +
+    '  vSeg=aSeg; vVal=aVal; gl_Position=vec4(q.x/uSim.x*2.-1.,1.-q.y/uSim.y*2.,0.,1.); }\n';
+  var SEG_FS = '#version 300 es\nprecision highp float;\n' +
+    'uniform vec2 uSim; flat in vec4 vSeg; flat in vec4 vVal; out vec4 o;\n' +
+    'void main(){ vec2 p=vec2(gl_FragCoord.x,uSim.y-gl_FragCoord.y), a=vSeg.xy, ab=vSeg.zw-a;\n' +
+    '  float t=clamp(dot(p-a,ab)/max(dot(ab,ab),1e-6),0.,1.), d=length(p-a-ab*t), r=vVal.x;\n' +
+    '  float core=1.-smoothstep(r*.3,r+.7,d), disc=1.-smoothstep(r-.8,r+.8,d), wet=1.-smoothstep(r,r+2.5,d);\n' +
+    '  o=vec4(vVal.y*core,vVal.z*disc,vVal.w*wet,0.); }\n';
+
+  // the frost state: r = ice, g = fresh (fed by a still person), b = mist / haze, a = wet glass
+  var UPD_FS = '#version 300 es\nprecision highp float;\n' +
+    'uniform sampler2D uState, uDep, uBody, uGlow; uniform mat3 uHinv; uniform vec2 uSim; uniform vec2 uEdge;\n' +
+    'uniform float uDt, uThaw, uMeltS, uFreshK, uMistK, uWetS, uRim, uHaze;\n' +
+    'in vec2 vUv; out vec4 o;\n' +
+    'float edgeBudget(vec2 p){ float dx=min(p.x,uSim.x-p.x), dy=min(p.y,uSim.y-p.y); float c=exp(-(dx*dx+dy*dy)/(2.*uEdge.y*uEdge.y));\n' +
+    '  return uEdge.x*(.55+1.9*c)-min(dx,dy); }\n' +
+    'void main(){ ivec2 ip=ivec2(gl_FragCoord.xy); vec4 s=texelFetch(uState,ip,0), d=texelFetch(uDep,ip,0);\n' +
+    '  vec2 w=vec2(vUv.x,1.-vUv.y); vec3 h=uHinv*vec3(w,1.); vec2 k=h.xy/max(h.z,1e-6);\n' +
+    '  float inK=(h.z>0.&&k.x>=0.&&k.x<=1.&&k.y>=0.&&k.y<=1.)?1.:0.; vec4 b=texture(uBody,clamp(k,0.,1.))*inK;\n' +
+    '  float heat=b.g, fed=smoothstep(0.,.06,b.b), pm=b.a;\n' +
+    '  float keep=max(fed,step(0.,edgeBudget(w*uSim)));\n' +
+    '  float ice0=max(s.r,d.r), ice=ice0-uDt*(1.-keep)*uThaw;\n' +
+    '  float melt=exp(-uDt*heat/uMeltS)*(1.-d.g);\n' +
+    '  ice=clamp(ice*melt,0.,1.);\n' +
+    '  float fresh=max(s.g*uFreshK,min(fed,s.g+uDt/.35));\n' +   // brightens over ~0.35 s (no flash after a Kinect blip), dims over FRESH_TAU
+    '  float rim=smoothstep(.02,.2,pm)*(1.-smoothstep(.3,.55,pm));\n' +
+    '  float g=texture(uGlow,vUv).g;\n' +
+    '  float m=max(s.b*uMistK,rim*uRim);\n' +
+    '  m=max(m,min(fed*clamp(g*1.8,0.,1.)*uHaze,s.b+uDt*uHaze/2.5));\n' +
+    '  m*=melt;\n' +
+    '  float wet=max(s.a-uDt/uWetS,max(d.b,min(1.,(ice0-ice)*3.)));\n' +
+    '  o=vec4(ice,fresh,m,wet); }\n';
+
+  // separable blur at a quarter of the picture: mode 0 reads the state (r = lit ice, g = raw ice), mode 1 blurs as is
+  var GLOW_FS = '#version 300 es\nprecision highp float;\n' +
+    'uniform sampler2D uSrc; uniform vec2 uStep; uniform float uRest; uniform int uMode; in vec2 vUv; out vec4 o;\n' +
+    'void main(){ vec4 acc=vec4(0.); float ws=0.;\n' +
+    '  for(int i=-6;i<=6;i++){ float wt=exp(-float(i*i)/14.); vec4 s=texture(uSrc,vUv+uStep*float(i));\n' +
+    '    vec4 v=uMode==0?vec4(s.r*mix(uRest,1.,s.g),s.r,s.b,s.a):s; acc+=v*wt; ws+=wt; }\n' +
+    '  o=acc/ws; }\n';
+
+  var DISP_FS = '#version 300 es\nprecision highp float;\n' +
+    'uniform sampler2D uState, uGlow, uBg, uBody, uDrops; uniform mat3 uHinv; uniform vec2 uRes;\n' +
+    'uniform float uTime, uRest, uSpark, uDark, uCity, uPx, uCap, uLift; in vec2 vUv; out vec4 o;\n' +
+    'float hash(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}\n' +
+    'float vnoise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.-2.*f);return mix(mix(hash(i),hash(i+vec2(1,0)),f.x),mix(hash(i+vec2(0,1)),hash(i+vec2(1,1)),f.x),f.y);}\n' +
+    'void main(){\n' +
+    '  vec4 s=texture(uState,vUv), g=texture(uGlow,vUv);\n' +
+    '  vec2 w=vec2(vUv.x,1.-vUv.y); vec3 h=uHinv*vec3(w,1.); vec2 k=h.xy/max(h.z,1e-6);\n' +
+    '  float inK=(h.z>0.&&k.x>=0.&&k.x<=1.&&k.y>=0.&&k.y<=1.)?1.:0.; vec4 b=texture(uBody,clamp(k,0.,1.))*inK;\n' +
+    '  float lit=mix(uRest,1.,s.g);\n' +
+    '  float frost=clamp(g.g*1.4+s.b*1.2,0.,1.);\n' +             // how frosted the glass is here
+    '  vec2 grad=vec2(dFdx(g.g),dFdy(g.g));\n' +
+    '  vec3 city=textureLod(uBg,vUv+grad*4.,frost*4.).rgb*uCity;\n' +
+    '  vec3 col=city*(1.+frost*.2)*(1.-.35*s.a*(1.-frost));\n' +
+    '  float line=smoothstep(.08,.95,s.r);\n' +
+    '  vec3 iceC=mix(vec3(.62,.80,1.),vec3(.93,.97,1.),smoothstep(.4,1.,s.r));\n' +
+    '  col+=iceC*line*lit*.86;\n' +
+    '  col+=vec3(.30,.55,1.)*g.r*.42;\n' +                            // the frost's glow (already dimmed where nobody feeds it)
+    '  float grain=.55+.45*vnoise(gl_FragCoord.xy*.33/uPx)*vnoise(gl_FragCoord.yx*.09/uPx+3.);\n' +
+    '  col+=vec3(.50,.66,.88)*s.b*.42*grain;\n' +                   // condensation mist and frost haze
+    '  col+=vec3(.08,.12,.17)*s.a*(1.-line)*.06;\n' +               // a faint wet sheen where it melted or was wiped
+    '  float wg=length(vec2(dFdx(s.a),dFdy(s.a)))*uPx;\n' +
+    '  col+=vec3(.55,.72,.95)*clamp(wg*3.5,0.,1.)*smoothstep(.45,.9,s.a+g.a)*.38;\n' +   // the water's edge along a wiped line
+    '  vec2 sq=gl_FragCoord.xy/(3.5*uPx), sc=floor(sq); float sh=hash(sc);\n' +
+    '  float tw=.5+.5*sin(uTime*(1.5+2.5*hash(sc+7.))+sh*40.);\n' +
+    '  float spk=step(.965,sh)*(1.-smoothstep(.1,.45,length(fract(sq)-.5)));\n' +
+    '  col+=vec3(1.)*spk*line*smoothstep(.5,1.,s.g)*tw*uSpark*.9;\n' +
+    '  vec4 dr=texture(uDrops,vUv); col+=dr.rgb;\n' +                 // drops and beads
+    '  float cap=max(uCap+(1.-uCap)*max(smoothstep(.03,.5,s.g),smoothstep(.04,.2,s.b)),dr.a), lu=dot(col,vec3(.2126,.7152,.0722));\n' +   // glass nobody feeds stays faint
+    '  col*=min(1.,cap/max(lu,1e-4));\n' +
+    '  col*=1.-uDark*smoothstep(.55,.8,b.r)*inK;\n' +
+    '  o=vec4(clamp(col*uLift,0.,1.),1.);\n' +   // uLift: music (1 = unchanged)
+    '}\n';
+
+  var DROP_VS = '#version 300 es\n' +
+    'layout(location=0) in vec4 aDrop; uniform vec2 uRes; flat out vec4 vD;\n' +
+    'void main(){ int i=gl_VertexID; vec2 c=vec2((i==1||i==2||i==4)?1.:0.,(i==2||i==4||i==5)?1.:0.)*2.-1.;\n' +
+    '  vec2 q=aDrop.xy+c*(aDrop.z+2.); vD=aDrop; gl_Position=vec4(q.x/uRes.x*2.-1.,1.-q.y/uRes.y*2.,0.,1.); }\n';
+  var DROP_FS = '#version 300 es\nprecision highp float;\n' +
+    'uniform vec2 uRes; flat in vec4 vD; out vec4 o;\n' +
+    'void main(){ vec2 px=vec2(gl_FragCoord.x,uRes.y-gl_FragCoord.y), p=(px-vD.xy)/vD.z; float d=length(p);\n' +
+    '  float disc=1.-smoothstep(.85,1.05,d), rim=smoothstep(.5,.95,d)*disc; vec2 hp=p-vec2(-.28,-.3); float hl=exp(-dot(hp,hp)*9.);\n' +
+    '  o=vec4((vec3(.88,.96,1.)*hl+vec3(.40,.60,.90)*rim*.45)*vD.w,vD.w*disc); }\n';
+
+  // the night city behind the glass, drawn once per size (mipmapped: frosted glass reads it blurred)
+  var BG_FS = '#version 300 es\nprecision highp float;\n' +
+    'uniform vec2 uRes; in vec2 vUv; out vec4 o;\n' +
+    'float h21(vec2 p){p=fract(p*vec2(123.34,456.21));p+=dot(p,p+45.32);return fract(p.x*p.y);}\n' +
+    'vec3 layer(vec2 p,float cell,float seed,float dens,float amp){ vec2 id=floor(p/cell); vec3 c=vec3(0.);\n' +
+    '  for(int j=-1;j<=1;j++) for(int i=-1;i<=1;i++){ vec2 g=id+vec2(float(i),float(j)); float h=h21(g+seed);\n' +
+    '    if(h<dens){ vec2 q=(vec2(h21(g+seed+3.1),h21(g+seed+7.3))*.8+.1+g)*cell; float r=cell*(.2+.25*h21(g+seed+11.));\n' +
+    '      float d=length(p-q), disc=1.-smoothstep(r*.8,r,d), rim=smoothstep(r*.55,r*.97,d)*disc*.45, pk=h21(g+seed+19.);\n' +
+    '      vec3 col=pk<.45?vec3(1.,.64,.28):pk<.75?vec3(1.,.88,.72):pk<.86?vec3(1.,.30,.18):vec3(.35,.78,1.);\n' +
+    '      c+=col*(disc*.55+rim)*(.35+.65*h21(g+seed+23.))*amp; } }\n' +
+    '  return c; }\n' +
+    'void main(){ vec2 p=vec2(vUv.x*uRes.x/uRes.y,vUv.y); float low=1.-smoothstep(.08,.6,vUv.y);\n' +
+    '  vec3 c=mix(vec3(.010,.013,.028),vec3(.004,.006,.016),vUv.y)+vec3(.030,.018,.012)*(1.-smoothstep(0.,.45,vUv.y));\n' +
+    '  c+=layer(p,.12,0.,.5,.058)*low; c+=layer(p+3.7,.065,5.,.42,.04)*(.2+.8*low);\n' +
+    '  o=vec4(c,1.); }\n';
+
+  function create(canvas, kit) {
+    if (!window.WallBody) throw new Error('Frost Window needs plugins/body.js');
+    var gl = canvas.getContext('webgl2', {alpha: false, antialias: false, depth: false});
+    if (!gl) throw new Error('Frost Window needs WebGL 2');
+    if (!gl.getExtension('EXT_color_buffer_float')) throw new Error('Frost Window needs EXT_color_buffer_float');
+    var floatLin = !!gl.getExtension('OES_texture_float_linear');
+    var SFMT = floatLin ? gl.RGBA32F : gl.RGBA16F, STYPE = floatLin ? gl.FLOAT : gl.HALF_FLOAT;
+    var made = [], sized = [], destroyed = false;
+    var wallK = 2.0;           // 'Empty wall' knob (1 = the 2026-10-05 picture): scales the unfed-frost glow, the night city, far-away drops and lifts REST_CAP with them; lit frost and mist are untouched
+
+    function shader(type, src) {
+      var s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { var e = gl.getShaderInfoLog(s); gl.deleteShader(s); throw new Error(e); }
+      return s;
+    }
+    function program(fsSrc, vsSrc) {
+      var p = gl.createProgram(), vs = shader(gl.VERTEX_SHADER, vsSrc || VS), fs = shader(gl.FRAGMENT_SHADER, fsSrc);
+      gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p); gl.deleteShader(vs); gl.deleteShader(fs);
+      if (!gl.getProgramParameter(p, gl.LINK_STATUS)) { var e = gl.getProgramInfoLog(p); gl.deleteProgram(p); throw new Error(e); }
+      made.push(['Program', p]);
+      var u = {}, n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+      for (var i = 0; i < n; i++) { var info = gl.getActiveUniform(p, i); u[info.name.replace(/\[0\]$/, '')] = gl.getUniformLocation(p, info.name); }
+      return {p: p, u: u};
+    }
+    function texture(w, h, ifmt, fmt, type, filter, list, mip) {
+      var t = gl.createTexture(); list.push(['Texture', t]);
+      gl.bindTexture(gl.TEXTURE_2D, t);
+      gl.texImage2D(gl.TEXTURE_2D, 0, ifmt, w, h, 0, fmt, type, null);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, mip ? gl.LINEAR_MIPMAP_LINEAR : filter);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      return t;
+    }
+    function target(t, list) {
+      var f = gl.createFramebuffer(); list.push(['Framebuffer', f]);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, f); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+      if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error('Frost Window: framebuffer incomplete');
+      gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+      return f;
+    }
+
+    var P = {seg: program(SEG_FS, SEG_VS), upd: program(UPD_FS), glow: program(GLOW_FS), disp: program(DISP_FS), drop: program(DROP_FS, DROP_VS), bg: program(BG_FS)};
+    var quadVao = gl.createVertexArray(); made.push(['VertexArray', quadVao]);
+    var MAX_SEG = MAX_TIPS + 800, segData = new Float32Array(MAX_SEG * 8), nSeg = 0;
+    var segVao = gl.createVertexArray(), segBuf = gl.createBuffer(); made.push(['VertexArray', segVao], ['Buffer', segBuf]);
+    gl.bindVertexArray(segVao); gl.bindBuffer(gl.ARRAY_BUFFER, segBuf); gl.bufferData(gl.ARRAY_BUFFER, segData.byteLength, gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 4, gl.FLOAT, false, 32, 0); gl.vertexAttribDivisor(0, 1);
+    gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 32, 16); gl.vertexAttribDivisor(1, 1);
+    var MAX_DD = DROPS_MAX + 200, dropData = new Float32Array(MAX_DD * 4);
+    var dropVao = gl.createVertexArray(), dropBuf = gl.createBuffer(); made.push(['VertexArray', dropVao], ['Buffer', dropBuf]);
+    gl.bindVertexArray(dropVao); gl.bindBuffer(gl.ARRAY_BUFFER, dropBuf); gl.bufferData(gl.ARRAY_BUFFER, dropData.byteLength, gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 4, gl.FLOAT, false, 16, 0); gl.vertexAttribDivisor(0, 1);
+    gl.bindVertexArray(null); gl.bindBuffer(gl.ARRAY_BUFFER, null);
+
+    // ---- the body, folded into maps this piece needs (Kinect cells, 128 x 106)
+    var BW = WallBody.w, BH = WallBody.h, BN = BW * BH, body = WallBody.create(kit, {});
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    var bodyTex = texture(BW, BH, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR, made), bodyBytes = new Uint8Array(BN * 4);
+    var pm = new Float32Array(BN), tmpA = new Float32Array(BN), rp = new Float32Array(BN), heat = new Float32Array(BN);
+    var bud = new Float32Array(BN).fill(-1e9), reachIdx = new Float32Array(64), outl = [], mapsAt = -1e9;
+    for (var oi = 0; oi < 64; oi++) outl.push([]);
+    var ent = {}, idKey = {}, keyIdx = new Int32Array(64), keySeq = 0, frameNo = 0, freshAt = -1e9;   // people, by a key that survives Kinect blips
+    var hm = new Float32Array(9), hmKey = '', cellPx = 5;
+
+    // ---- everything sized by the canvas
+    var W = 0, H = 0, SW = 0, SH = 0, GW = 0, GH = 0, pxS = 0.5, cur = 0;
+    var state = [null, null], stateFb = [null, null], dep, depFb, glowA, glowAFb, glowB, glowBFb, bgTex, bgFb, dropTex, dropFb;
+    var gw = 0, gh = 0, gN = 0, gIce, gTree, gTip, gPar, gWet, gBody, gEdgeK, gEdgeD;
+    var track = !!window.WallTest;          // who grew which fern: only the sandbox's debug view needs it (the live wall never grows this map)
+    var tips = [], born = [], drops = [], treeSeq = 0, tipSeq = 0, treeOwner = {}, ownerTips = {}, edgeTipN = 0;
+    var elapsed = 0, frames = 0, gAcc = 0, edgeAcc = 0, breath = 0.7, wipes = 0, dropsMade = 0, seedsMade = 0;
+    var fPrev = [], fNow = [], lastFingerAt = -1e9, wipeAcc = 0;
+
+    function alloc(w, h) {
+      sized.reverse().forEach(function (r) { gl['delete' + r[0]](r[1]); }); sized = [];
+      W = w; H = h; SW = Math.max(64, Math.round(w / 2)); SH = Math.max(40, Math.round(h / 2));
+      GW = Math.max(16, Math.round(SW / 2)); GH = Math.max(10, Math.round(SH / 2)); pxS = SW / 1280;
+      for (var k = 0; k < 2; k++) { state[k] = texture(SW, SH, SFMT, gl.RGBA, STYPE, gl.LINEAR, sized); stateFb[k] = target(state[k], sized); }
+      dep = texture(SW, SH, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.NEAREST, sized); depFb = target(dep, sized);
+      glowA = texture(GW, GH, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, gl.LINEAR, sized); glowAFb = target(glowA, sized);
+      glowB = texture(GW, GH, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, gl.LINEAR, sized); glowBFb = target(glowB, sized);
+      dropTex = texture(W, H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.NEAREST, sized); dropFb = target(dropTex, sized);
+      bgTex = texture(W, H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR, sized, true); bgFb = target(bgTex, sized);
+      gl.viewport(0, 0, W, H); gl.useProgram(P.bg.p); gl.uniform2f(P.bg.u.uRes, W, H);
+      gl.bindVertexArray(quadVao); gl.drawArrays(gl.TRIANGLES, 0, 3); gl.bindVertexArray(null);
+      gl.bindTexture(gl.TEXTURE_2D, bgTex); gl.generateMipmap(gl.TEXTURE_2D);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gw = Math.ceil(SW / 2); gh = Math.ceil(SH / 2); gN = gw * gh;
+      gIce = new Float32Array(gN); gTree = new Int32Array(gN); gTip = new Int32Array(gN); gPar = new Int32Array(gN); gWet = new Float32Array(gN); gBody = new Int32Array(gN);
+      gEdgeK = new Float32Array(gN); gEdgeD = new Float32Array(gN);
+      for (var c = 0; c < gN; c++) { var x = (c % gw) * 2 + 1, y = ((c / gw) | 0) * 2 + 1; gEdgeK[c] = edgeK(x, y); gEdgeD[c] = Math.min(x, SW - x, y, SH - y); }
+      hmKey = ''; syncReg();
+      tips = []; born = []; drops = []; treeOwner = {}; ownerTips = {}; edgeTipN = 0; cur = 0;
+    }
+
+    // ---- mapping: sim px (window, y down) <-> Kinect cells
+    function syncReg() {
+      var m = body.hinv(), key = Array.prototype.join.call(m, ',');
+      if (key === hmKey) return;
+      hmKey = key; hm.set(m);
+      for (var c = 0; c < gN; c++) gBody[c] = bodyIdxAt((c % gw) * 2 + 1, ((c / gw) | 0) * 2 + 1);
+      var a = kTex(0.5, 0.5), bx = kTex(0.51, 0.5), by = kTex(0.5, 0.51);   // sim px per Kinect cell, near the middle
+      if (a && bx && by) {
+        var sx = 0.01 * SW / Math.max(1e-6, Math.hypot((bx[0] - a[0]) * BW, (bx[1] - a[1]) * BH));
+        var sy = 0.01 * SH / Math.max(1e-6, Math.hypot((by[0] - a[0]) * BW, (by[1] - a[1]) * BH));
+        cellPx = Math.max(1, Math.min(40, (sx + sy) / 2));
+      }
+    }
+    function kTex(x, y) {                     // window 0..1 -> Kinect texture 0..1 (null behind the camera)
+      var w = hm[2] * x + hm[5] * y + hm[8]; if (w <= 1e-6) return null;
+      return [(hm[0] * x + hm[3] * y + hm[6]) / w, (hm[1] * x + hm[4] * y + hm[7]) / w];
+    }
+    function bodyIdxAt(xs, ys) {
+      var k = kTex(xs / SW, ys / SH); if (!k || k[0] < 0 || k[0] >= 1 || k[1] < 0 || k[1] >= 1) return -1;
+      return ((k[1] * BH) | 0) * BW + ((k[0] * BW) | 0);
+    }
+    function toSim(u, v) { var s = kit.toScreen(u, v); if (!s) s = [u / 512, v / 424]; return [s[0] * SW, s[1] * SH]; }
+    function gridAt(x, y) { var gx = (x * 0.5) | 0, gy = (y * 0.5) | 0; return gx < 0 || gy < 0 || gx >= gw || gy >= gh ? -1 : gy * gw + gx; }
+    function edgeK(x, y) { var dx = Math.min(x, SW - x), dy = Math.min(y, SH - y), s = EDGE_CORNER * SH; return 0.55 + 1.9 * Math.exp(-(dx * dx + dy * dy) / (2 * s * s)); }
+    function edgeBudget(x, y) { return EDGE_REACH * pxS * breath * edgeK(x, y) - Math.min(x, SW - x, y, SH - y); }
+
+    // ---- people: stillness per person (from the stage's people[i].still), reach and growth speed from it
+    function reachOf(c) { return c < STILL_GRACE_S ? 0 : REACH_START + (REACH_MAX - REACH_START) * (1 - Math.exp(-3 * (c - STILL_GRACE_S) / REACH_RAMP_S)); }
+    function growOf(c) { return GROW_START + (GROW_MAX - GROW_START) * (1 - Math.exp(-3 * Math.max(0, c - STILL_GRACE_S) / GROW_RAMP_S)); }
+    // A person keeps their stillness (and their frost) across a Kinect blip or an id swap: a new stage id that appears near
+    // someone seen in the last 1.5 s takes over that person's entry, and their stillness is not spent for 1 s while the stage re-settles.
+    function peopleStep(dt, now) {
+      var ps = body.fresh ? body.people : [], n = Math.min(64, ps.length), i, k, e, nk = {};
+      frameNo++; reachIdx.fill(0);
+      for (i = 0; i < n; i++) { k = idKey[ps[i].id]; keyIdx[i] = k !== undefined && ent[k] ? k : -1; if (keyIdx[i] >= 0) ent[k].frame = frameNo; }
+      for (i = 0; i < n; i++) {
+        var p = ps[i];
+        if (keyIdx[i] < 0) {
+          var best = null, bd = 0.12;
+          for (var kk in ent) { var q = ent[kk]; if (q.frame === frameNo || now - q.seen > 1500) continue; var dd = Math.hypot(q.cx - p.cx, q.cy - p.cy); if (dd < bd) { bd = dd; best = q; } }
+          if (best) best.grace = now + 1000; else { best = ent[++keySeq] = {key: keySeq, c: 0, acc: 0, grace: 0}; }
+          best.frame = frameNo; keyIdx[i] = best.key;
+        }
+        e = ent[keyIdx[i]]; nk[p.id] = e.key; e.seen = now; e.cx = p.cx; e.cy = p.cy;
+        if (p.still > 0) e.c = Math.min(CHILL_CAP, e.c + dt);                                        // the stage says still: frost is earned
+        else if (p.moving > SETTLE_MOVE && now > e.grace) e.c = Math.max(0, e.c - dt * CHILL_LOSS);   // really moving: it is spent (a twitch only pauses it)
+        reachIdx[i] = reachOf(e.c);
+      }
+      idKey = nk;
+      for (k in ent) if (now - ent[k].seen > 2000) delete ent[k];
+    }
+    function blur(src, dst, horiz) {
+      for (var y = 0; y < BH; y++) for (var x = 0; x < BW; x++) {
+        var i = y * BW + x, a, b;
+        if (horiz) { a = x > 0 ? src[i - 1] : src[i]; b = x < BW - 1 ? src[i + 1] : src[i]; }
+        else { a = y > 0 ? src[i - BW] : src[i]; b = y < BH - 1 ? src[i + BW] : src[i]; }
+        dst[i] = (a + 2 * src[i] + b) * 0.25;
+      }
+    }
+    function maxChamfer(d) {                  // in place: each cell keeps the best (budget - distance) of its neighbours
+      var x, y, i, v, R2 = 1.4142;
+      for (y = 0; y < BH; y++) for (x = 0; x < BW; x++) { i = y * BW + x; v = d[i];
+        if (x > 0) v = Math.max(v, d[i - 1] - 1);
+        if (y > 0) { v = Math.max(v, d[i - BW] - 1); if (x > 0) v = Math.max(v, d[i - BW - 1] - R2); if (x < BW - 1) v = Math.max(v, d[i - BW + 1] - R2); }
+        d[i] = v; }
+      for (y = BH - 1; y >= 0; y--) for (x = BW - 1; x >= 0; x--) { i = y * BW + x; v = d[i];
+        if (x < BW - 1) v = Math.max(v, d[i + 1] - 1);
+        if (y < BH - 1) { v = Math.max(v, d[i + BW] - 1); if (x < BW - 1) v = Math.max(v, d[i + BW + 1] - R2); if (x > 0) v = Math.max(v, d[i + BW - 1] - R2); }
+        d[i] = v; }
+    }
+    function bodyMaps(dtS) {
+      var lab = body.label, mk = body.mask, mo = body.motion, anyone = body.fresh && body.people.length > 0, i, x, y;
+      for (i = 0; i < BN; i++) pm[i] = anyone && lab[i] >= 0 ? 1 : 0;
+      blur(pm, tmpA, true); blur(tmpA, pm, false); blur(pm, tmpA, true); blur(tmpA, pm, false);
+      var kd = Math.exp(-Math.max(0.001, dtS) / 0.6);
+      for (i = 0; i < BN; i++) { rp[i] = Math.max(rp[i] * kd, pm[i] > 0.02 ? 1 : 0); heat[i] = mo[i] * rp[i]; }
+      blur(heat, tmpA, true); blur(tmpA, heat, false); blur(heat, tmpA, true); blur(tmpA, heat, false);
+      for (i = 0; i < BN; i++) { var hv = heat[i] * HEAT_GAIN; heat[i] = hv > 1 ? 1 : hv < 0.01 ? 0 : hv; }
+      for (i = 0; i < BN; i++) { var l = lab[i]; bud[i] = anyone && l >= 0 && l < 64 && reachIdx[l] > 0 ? reachIdx[l] : -1e9; }
+      maxChamfer(bud);
+      for (i = 0; i < 64; i++) outl[i].length = 0;
+      if (anyone) for (y = 1; y < BH - 1; y++) for (x = 1; x < BW - 1; x++) {
+        i = y * BW + x; var l2 = lab[i];
+        if (l2 >= 0 && l2 < 64 && (lab[i - 1] < 0 || lab[i + 1] < 0 || lab[i - BW] < 0 || lab[i + BW] < 0)) outl[l2].push(i);
+      }
+      for (i = 0; i < BN; i++) {
+        var j = i * 4;
+        bodyBytes[j] = mk[i] * 255 + 0.5; bodyBytes[j + 1] = heat[i] * 255 + 0.5;
+        bodyBytes[j + 2] = bud[i] > 0 ? Math.min(255, bud[i] / REACH_MAX * 255 + 0.5) : 0; bodyBytes[j + 3] = pm[i] * 255 + 0.5;
+      }
+      gl.bindTexture(gl.TEXTURE_2D, bodyTex); gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, BW, BH, gl.RGBA, gl.UNSIGNED_BYTE, bodyBytes);
+    }
+
+    // ---- crystal tips
+    function pushSeg(x0, y0, x1, y1, r, ice, erase, wet) {
+      if (nSeg >= MAX_SEG) return;
+      var o = nSeg++ * 8;
+      segData[o] = x0; segData[o + 1] = y0; segData[o + 2] = x1; segData[o + 3] = y1;
+      segData[o + 4] = r; segData[o + 5] = ice; segData[o + 6] = erase; segData[o + 7] = wet;
+    }
+    function crowded(x, y, r) {
+      var g0 = gridAt(x, y); if (g0 < 0) return true;
+      var R = Math.ceil(r * 0.5), gx = g0 % gw, gy = (g0 / gw) | 0;
+      for (var yy = Math.max(0, gy - R); yy <= Math.min(gh - 1, gy + R); yy++)
+        for (var xx = Math.max(0, gx - R); xx <= Math.min(gw - 1, gx + R); xx++) {
+          var c = yy * gw + xx; if ((gIce[c] > 0.3 || gWet[c] > 0.3) && (xx - gx) * (xx - gx) + (yy - gy) * (yy - gy) <= R * R) return true;
+        }
+      return false;
+    }
+    function newTip(list, x, y, a, gen, owner, tree, parent, len, w, grace, graceTree) {
+      var t = {id: ++tipSeq, parent: parent, tree: tree, gen: gen, k: 1, margin: 0, owner: owner, x: x, y: y, a: a, left: len, w: w, grace: grace, graceTree: graceTree || 0,
+               nb: gen === 0 ? BARB_EVERY * pxS * (0.3 + 0.7 * Math.random()) : gen === 1 && Math.random() < TWIG ? len * (0.35 + 0.3 * Math.random()) : 1e9,
+               side: Math.random() < 0.5 ? 1 : -1, bside: 1, curl: (Math.random() * 2 - 1) * CURL / (100 * pxS), trav: 0, stall: 0};
+      list.push(t); return t;
+    }
+    function rateFor(owner) { var e = ent[owner]; return e ? growOf(e.c) : GROW_START; }
+    function sprout(p, gen, deg, len, grace, graceTree) {
+      if (len < 1.5) return null;
+      var c = newTip(born, p.x, p.y, p.a + deg * Math.PI / 180 + (Math.random() - 0.5) * 0.12, gen, p.owner, p.tree, p.id, len,
+                     p.w * GEN_W[gen] / GEN_W[p.gen], grace, graceTree);
+      c.k = p.k; c.margin = p.margin; c.bside = deg > 0 ? 1 : -1; c.curl = gen === 0 ? (Math.random() * 2 - 1) * CURL / (100 * pxS) : p.curl * 0.5;
+      return c;
+    }
+    function branch(p, room) {
+      if (tips.length + born.length >= MAX_TIPS || (p.owner < 0 && edgeTipN + born.length >= EDGE_TIPS)) { p.nb = 1e9; return; }
+      if (p.gen === 1) { sprout(p, 2, (Math.random() < 0.75 ? -p.bside : p.bside) * BARB_ANGLE, p.left * 0.45, 2, 0); p.nb = 1e9; return; }
+      p.nb += BARB_EVERY * pxS * (0.75 + 0.5 * Math.random());
+      if (Math.random() < FORK) sprout(p, 0, p.side * (FORK_ANGLE + (Math.random() - 0.5) * 16), 1e6, 2, 16 * pxS);
+      var L = BARB_LEN * pxS * Math.min(1, Math.max(0.12, room / (BARB_LEN * pxS * 2.4))) * (0.6 + 0.55 * Math.random());
+      sprout(p, 1, p.side * BARB_ANGLE, L, 3, 0);
+      if (Math.random() < PAIRED) sprout(p, 1, -p.side * BARB_ANGLE, L * (0.75 + 0.35 * Math.random()), 3, 0);
+      p.side = -p.side;
+    }
+    function blocked(p, c) {                // another crystal (not my parent, not my own child) or wet glass ahead
+      if (gWet[c] > 0.3) return true;
+      if (!(gIce[c] > 0.3)) return false;
+      var t = gTip[c];
+      if (t === p.id || t === p.parent || gPar[c] === p.id) return false;
+      if (gTree[c] === p.tree && p.trav < p.graceTree) return false;
+      return true;
+    }
+    function stepTip(p, dt) {
+      var bi = bodyIdxAt(p.x, p.y);
+      if (bi >= 0 && (body.mask[bi] > 0.45 || heat[bi] > 0.25)) return false;   // walked into a person, or into warmth
+      var b = (p.owner >= 0 ? (bi >= 0 && bud[bi] > 0 ? bud[bi] * cellPx : -1) : edgeBudget(p.x, p.y)) - p.margin;   // each fern stops a little short of its own
+      if (b <= 0) { p.stall += dt; return p.stall < STALL_S; }
+      p.stall = 0;
+      var speed = (p.owner >= 0 ? rateFor(p.owner) : EDGE_SPEED) * GEN_SPEED[p.gen] * pxS * Math.min(1, 0.3 + b / (4 * cellPx));
+      var dist = Math.min(speed * dt, p.left), x0 = p.x, y0 = p.y, alive = true;
+      while (dist > 1e-4) {
+        var ds = Math.min(1.5, dist); dist -= ds;
+        p.a += p.curl * ds;
+        var ca = Math.cos(p.a), sa = Math.sin(p.a), nx = p.x + ca * ds, ny = p.y + sa * ds;
+        if (nx < 1 || ny < 1 || nx > SW - 1 || ny > SH - 1) { alive = false; break; }
+        if (p.trav > p.grace) { var la = gridAt(nx + ca * LOOK, ny + sa * LOOK); if (la >= 0 && blocked(p, la)) { p.x = nx; p.y = ny; alive = false; break; } }
+        p.x = nx; p.y = ny; p.trav += ds; p.left -= ds;
+        var gc = gridAt(nx, ny); if (gc >= 0) { gIce[gc] = 1; gTree[gc] = p.tree; gTip[gc] = p.id; gPar[gc] = p.parent; }
+        p.nb -= ds; if (p.nb <= 0) branch(p, b);
+        if (p.left <= 0) { alive = false; break; }
+      }
+      if (p.x !== x0 || p.y !== y0) pushSeg(x0, y0, p.x, p.y, p.w, GEN_ICE[p.gen] * p.k, 0, 0);
+      return alive;
+    }
+    function tipsStep(dt) {
+      var keep = 0, i;
+      ownerTips = {}; edgeTipN = 0;
+      for (i = 0; i < tips.length; i++) {
+        var p = tips[i];
+        if (stepTip(p, dt)) { tips[keep++] = p; if (p.owner < 0) edgeTipN++; else ownerTips[p.owner] = (ownerTips[p.owner] || 0) + 1; }
+      }
+      tips.length = keep;
+      for (i = 0; i < born.length && tips.length < MAX_TIPS; i++) tips.push(born[i]);
+      born.length = 0;
+    }
+    function seedPeople(dt) {
+      var ps = body.fresh ? body.people : [], sdf = body.sdf;
+      for (var i = 0; i < ps.length && i < 64; i++) {
+        var key = keyIdx[i], e = ent[key], ol = outl[i];
+        if (!e || reachIdx[i] <= 0 || !ol.length) continue;
+        if ((ownerTips[key] || 0) >= MAX_TIPS * OWNER_SHARE) continue;
+        e.acc = Math.min(4, e.acc + dt * ROOTS_PER_S * Math.min(2, ol.length / 160));
+        for (var tries = 0; e.acc >= 1 && tries < 10; tries++) {
+          e.acc -= 1;
+          var ci = ol[(Math.random() * ol.length) | 0], cx = ci % BW, cy = (ci / BW) | 0;
+          if (cx < 1 || cy < 1 || cx >= BW - 1 || cy >= BH - 1) continue;
+          var nx = sdf[ci + 1] - sdf[ci - 1], ny = sdf[ci + BW] - sdf[ci - BW], nl = Math.hypot(nx, ny);
+          if (nl < 1e-3) continue;
+          nx /= nl; ny /= nl;
+          var a = toSim((cx + 0.5 + nx * 1.4) * 4, (cy + 0.5 + ny * 1.4) * 4), b = toSim((cx + 0.5 + nx * 3.4) * 4, (cy + 0.5 + ny * 3.4) * 4);
+          if (a[0] < 2 || a[1] < 2 || a[0] > SW - 2 || a[1] > SH - 2) continue;
+          var bi = bodyIdxAt(a[0], a[1]);
+          if (bi < 0 || body.mask[bi] > 0.45 || bud[bi] <= 0 || crowded(a[0], a[1], ROOT_GAP * pxS)) continue;
+          var ang = Math.atan2(b[1] - a[1], b[0] - a[0]) + (Math.random() * 2 - 1) * ROOT_JITTER;
+          var tree = ++treeSeq; if (track) treeOwner[tree] = key;
+          var rt = newTip(tips, a[0], a[1], ang, 0, key, tree, 0, 1e6, STEM_PX * pxS, 3, 0); rt.k = 0.7 + 0.3 * Math.random(); rt.margin = Math.pow(Math.random(), 1.5) * RAGGED * cellPx;
+          seedsMade++;
+        }
+      }
+    }
+    function seedEdges(dt) {
+      edgeAcc = Math.min(3, edgeAcc + dt * EDGE_ROOTS_S);
+      for (var tries = 0; edgeAcc >= 1 && tries < 4; tries++) {
+        edgeAcc -= 1;
+        if (edgeTipN >= EDGE_TIPS || tips.length >= MAX_TIPS) return;
+        var u = Math.random(), t = u < 0.5 ? 0.5 * Math.pow(2 * u, 1.7) : 1 - 0.5 * Math.pow(2 * (1 - u), 1.7);   // more often near corners
+        var side = Math.random() * 2 * (SW + SH), x, y, a;
+        if (side < SW) { x = t * SW; y = 1.5; a = Math.PI / 2; }
+        else if (side < 2 * SW) { x = t * SW; y = SH - 1.5; a = -Math.PI / 2; }
+        else if (side < 2 * SW + SH) { x = 1.5; y = t * SH; a = 0; }
+        else { x = SW - 1.5; y = t * SH; a = Math.PI; }
+        var b = edgeBudget(x, y);
+        if (b < 6 * pxS || crowded(x, y, ROOT_GAP * pxS * 0.8)) continue;
+        var tree = ++treeSeq; if (track) treeOwner[tree] = -1;
+        var et = newTip(tips, x, y, a + (Math.random() * 2 - 1) * 0.8, 0, -1, tree, 0, 1e6, STEM_PX * pxS * 0.8, 2, 0); et.k = 0.75 + 0.25 * Math.random(); et.margin = Math.random() * 0.4 * b;
+        edgeTipN++;
+      }
+    }
+
+    // ---- the CPU mirror of the ice: thaw, melt (and where it melts, drops), drying
+    var mSpark = 1, mLift = 1, musPrev = 0;
+    function musicFrost(dt) {   // music: each beat bursts crystal growth from a drifting point on the edge; high makes the highlights sparkle
+      var m = kit.music ? kit.music() : null, e = m && m.enabled && m.fresh ? m.amount : 0, bass = e ? e * m.bands[0] : 0, mid = e ? e * m.bands[1] : 0, high = e ? e * m.bands[2] : 0, beat = e ? e * m.pulse : 0;
+      mSpark = 1 + 3 * high; mLift = 1 + .6 * beat + .15 * bass;
+      if (e && m.pulse > .95 && musPrev <= .95) {
+        var n = 3 + Math.round(beat * 5), side = Math.sin(elapsed * .31) > 0, ex = .5 + .4 * Math.sin(elapsed * .19);
+        for (var i = 0; i < n; i++) {
+          if (edgeTipN >= EDGE_TIPS + 8 || tips.length >= MAX_TIPS) break;
+          var x = Math.max(.03, Math.min(.97, ex + (Math.random() - .5) * .12)) * SW, y = side ? 1.5 : SH - 1.5, b = edgeBudget(x, y);
+          if (b < 6 * pxS || crowded(x, y, ROOT_GAP * pxS * 0.8)) continue;
+          var tree = ++treeSeq; if (track) treeOwner[tree] = -1;
+          var et = newTip(tips, x, y, (side ? Math.PI / 2 : -Math.PI / 2) + (Math.random() * 2 - 1) * 0.8, 0, -1, tree, 0, 1e6, STEM_PX * pxS * 0.8, 2, 0); et.k = 0.75 + 0.25 * Math.random(); et.margin = Math.random() * 0.4 * b;
+          edgeTipN++;
+        }
+      }
+      musPrev = m ? m.pulse : 0;
+    }
+    function gridStep(dt) {
+      gAcc += dt; if (gAcc < 0.05) return;
+      var d = gAcc; gAcc = 0;
+      var thaw = d / THAW_S, wd = d / WET_S, reachE = EDGE_REACH * pxS * breath, spawned = 0;
+      for (var c = 0; c < gN; c++) {
+        if (gWet[c] > 0) gWet[c] = Math.max(0, gWet[c] - wd);
+        var v = gIce[c]; if (v <= 0) continue;
+        var bi = gBody[c];
+        if (!(bi >= 0 && bud[bi] > 0) && reachE * gEdgeK[c] - gEdgeD[c] <= 0) v -= thaw;
+        if (bi >= 0 && heat[bi] > 0.01) {
+          var nv = v * Math.exp(-d * heat[bi] / MELT_S);
+          if (v > 0.45 && nv <= 0.45 && spawned < 3 && drops.length < DROPS_MAX && Math.random() < DROP_CHANCE) {
+            addDrop((c % gw) * 2 + 1, ((c / gw) | 0) * 2 + 1, (2.6 + Math.random() * 2.4) * pxS, false); spawned++;
+          }
+          v = nv;
+        }
+        gIce[c] = v > 0.02 ? v : 0;
+      }
+    }
+
+    // ---- drops (run down, clearing a track) and beads (sit still, dry)
+    function addDrop(x, y, r, bead) {
+      if (drops.length >= DROPS_MAX) return;
+      drops.push({x: x, y: y, r: r, vy: 0, stick: bead ? 1e9 : 0.15 + Math.random() * 0.9, wob: Math.random() * 6.28, life: 0,
+                  bead: bead, dry: WET_S * (0.5 + 0.5 * Math.random())});
+      dropsMade++;
+    }
+    function dropsStep(dt) {
+      var keep = 0;
+      for (var i = 0; i < drops.length; i++) {
+        var d = drops[i]; d.life += dt;
+        if (d.bead) { if (d.life < d.dry) drops[keep++] = d; continue; }
+        d.stick -= dt;
+        var target = d.stick > 0 ? 0 : DROP_SPEED * pxS * (0.55 + 0.45 * d.r / (2.5 * pxS));
+        d.vy += (target - d.vy) * (1 - Math.exp(-dt * 6));
+        if (d.stick <= 0 && Math.random() < dt * 0.9) d.stick = 0.1 + Math.random() * 0.7;   // catches on the glass again
+        var x0 = d.x, y0 = d.y;
+        d.wob += dt * 2.3; d.y += d.vy * dt; d.x += Math.sin(d.wob) * d.vy * dt * 0.12;
+        if (d.vy > 0.5) {
+          pushSeg(x0, y0, d.x, d.y, d.r * 0.6, 0, 0.92, 0.7);
+          var gc = gridAt(d.x, d.y); if (gc >= 0) { gIce[gc] *= 0.08; gWet[gc] = Math.max(gWet[gc], 0.9); }
+          d.r *= Math.exp(-dt * 0.08);
+        }
+        if (d.y < SH + 6 && d.r > 0.6 * pxS && d.life < 40) drops[keep++] = d;
+      }
+      drops.length = keep;
+    }
+
+    // ---- fingertips: a warm finger wipes a clear, wet line; beads sit along its edges
+    function wipe(x0, y0, x1, y1, first) {
+      var r = WIPE_PX * pxS, len = Math.hypot(x1 - x0, y1 - y0), n = Math.max(1, Math.ceil(len / 1.5));
+      pushSeg(x0, y0, x1, y1, r, 0, 1, 1);
+      for (var s = 0; s <= n; s++) {
+        var x = x0 + (x1 - x0) * s / n, y = y0 + (y1 - y0) * s / n, g0 = gridAt(x, y); if (g0 < 0) continue;
+        var R = Math.ceil(r * 0.5), gx = g0 % gw, gy = (g0 / gw) | 0;
+        for (var yy = Math.max(0, gy - R); yy <= Math.min(gh - 1, gy + R); yy++)
+          for (var xx = Math.max(0, gx - R); xx <= Math.min(gw - 1, gx + R); xx++) { var c = yy * gw + xx; gIce[c] = 0; gWet[c] = 1; }
+      }
+      wipeAcc += len + (first ? 14 * pxS : 0);
+      var nx = len > 1e-3 ? -(y1 - y0) / len : 0, ny = len > 1e-3 ? (x1 - x0) / len : 1;
+      while (wipeAcc > 9 * pxS) {
+        wipeAcc -= 9 * pxS;
+        var t = Math.random(), sd = Math.random() < 0.5 ? -1 : 1, off = r + (0.5 + Math.random() * 2) * pxS;
+        if (len < 1e-3) { var ang = Math.random() * 6.283; nx = Math.cos(ang); ny = Math.sin(ang); }
+        var big = Math.random() < 0.12;
+        addDrop(x0 + (x1 - x0) * t + nx * off * sd, y0 + (y1 - y0) * t + ny * off * sd, (big ? 4.4 : 2.2 + Math.random() * 1.5) * pxS, !big);
+      }
+      wipes++;
+    }
+    function fingersStep(now) {
+      var f = kit.fingers, pts = [], i, tnow = Date.now();
+      if (f && Array.isArray(f.pts)) { if (tnow - f.t <= 160) pts = f.pts; }
+      else for (i = 0; i < kit.touches.length; i++) if (tnow - kit.touches[i].t < 250) pts.push([kit.touches[i].x, kit.touches[i].y]);
+      fNow = [];
+      for (i = 0; i < pts.length && i < 10; i++) {
+        var q = pts[i]; if (!q || !(q[0] >= 0 && q[0] <= 1 && q[1] >= 0 && q[1] <= 1)) continue;
+        var x = q[0] * SW, y = q[1] * SH, best = null, bd = 0.08 * SW;
+        for (var j = 0; j < fPrev.length; j++) { var dd = Math.hypot(fPrev[j][0] - x, fPrev[j][1] - y); if (dd < bd) { bd = dd; best = fPrev[j]; } }
+        wipe(best ? best[0] : x, best ? best[1] : y, x, y, !best);
+        fNow.push([x, y]);
+      }
+      fPrev = fNow;
+      if (fNow.length) lastFingerAt = now;
+    }
+
+    // ---- GPU passes
+    function fullscreen() { gl.bindVertexArray(quadVao); gl.drawArrays(gl.TRIANGLES, 0, 3); }
+    function bindTex(unit, t) { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t); }
+    function simPasses(dt) {
+      gl.disable(gl.DEPTH_TEST);
+      // 1. this frame's new crystal, wipes and drop tracks
+      gl.bindFramebuffer(gl.FRAMEBUFFER, depFb); gl.viewport(0, 0, SW, SH); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+      if (nSeg) {
+        gl.enable(gl.BLEND); gl.blendEquation(gl.MAX); gl.blendFunc(gl.ONE, gl.ONE);
+        gl.useProgram(P.seg.p); gl.uniform2f(P.seg.u.uSim, SW, SH);
+        gl.bindVertexArray(segVao); gl.bindBuffer(gl.ARRAY_BUFFER, segBuf); gl.bufferSubData(gl.ARRAY_BUFFER, 0, segData, 0, nSeg * 8);
+        gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, nSeg);
+        gl.disable(gl.BLEND); gl.blendEquation(gl.FUNC_ADD);
+      }
+      // 2. fold it into the frost
+      var nxt = 1 - cur;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, stateFb[nxt]); gl.viewport(0, 0, SW, SH);
+      var U = P.upd.u; gl.useProgram(P.upd.p);
+      bindTex(0, state[cur]); bindTex(1, dep); bindTex(2, bodyTex); bindTex(3, glowB);
+      gl.uniform1i(U.uState, 0); gl.uniform1i(U.uDep, 1); gl.uniform1i(U.uBody, 2); gl.uniform1i(U.uGlow, 3);
+      gl.uniformMatrix3fv(U.uHinv, false, hm); gl.uniform2f(U.uSim, SW, SH);
+      gl.uniform2f(U.uEdge, EDGE_REACH * pxS * breath, EDGE_CORNER * SH);
+      gl.uniform1f(U.uDt, dt); gl.uniform1f(U.uThaw, 1 / THAW_S); gl.uniform1f(U.uMeltS, MELT_S);
+      gl.uniform1f(U.uFreshK, Math.exp(-dt / FRESH_TAU)); gl.uniform1f(U.uMistK, Math.exp(-dt / 0.7)); gl.uniform1f(U.uWetS, WET_S);
+      gl.uniform1f(U.uRim, RIM); gl.uniform1f(U.uHaze, HAZE);
+      fullscreen(); cur = nxt;
+      // 3. the glow
+      var G = P.glow.u; gl.useProgram(P.glow.p); gl.uniform1i(G.uSrc, 0); gl.uniform1f(G.uRest, Math.min(1, REST_GLOW * wallK));
+      gl.bindFramebuffer(gl.FRAMEBUFFER, glowAFb); gl.viewport(0, 0, GW, GH); bindTex(0, state[cur]);
+      gl.uniform2f(G.uStep, 1 / GW, 0); gl.uniform1i(G.uMode, 0); fullscreen();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, glowBFb); bindTex(0, glowA);
+      gl.uniform2f(G.uStep, 0, 1 / GH); gl.uniform1i(G.uMode, 1); fullscreen();
+    }
+    function draw(now) {
+      // drops and beads: little lenses with a highlight, bright only near someone (the strongest light is theirs)
+      var n = 0, sx = W / SW, sy = H / SH, near = body.fresh && body.people.length > 0, sdf = body.sdf;
+      for (var i = 0; i < drops.length && n < MAX_DD; i++) {
+        var d = drops[i], bi = near ? bodyIdxAt(d.x, d.y) : -1, lit = bi >= 0 ? Math.max(0, Math.min(1, (12 - sdf[bi]) / 8)) : 0;
+        if (d.bead) lit = Math.max(lit, 1 - (now - lastFingerAt) / 1500) * Math.max(0, 1 - d.life / d.dry * 0.5);
+        dropData[n * 4] = d.x * sx; dropData[n * 4 + 1] = d.y * sy; dropData[n * 4 + 2] = Math.max(1.2, d.r * sx);
+        var dim = Math.min(1, DROP_DIM * wallK); dropData[n * 4 + 3] = dim + (1 - dim) * Math.max(0, Math.min(1, lit)); n++;
+      }
+      for (var f = 0; f < fPrev.length && n < MAX_DD; f++) {   // the wet glint right under a fingertip
+        dropData[n * 4] = fPrev[f][0] * sx; dropData[n * 4 + 1] = fPrev[f][1] * sy; dropData[n * 4 + 2] = WIPE_PX * 0.8 * W / 1280; dropData[n * 4 + 3] = 0.75; n++;
+      }
+      gl.bindFramebuffer(gl.FRAMEBUFFER, dropFb); gl.viewport(0, 0, W, H); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+      if (n) {
+        gl.enable(gl.BLEND); gl.blendEquation(gl.FUNC_ADD); gl.blendFunc(gl.ONE, gl.ONE);
+        gl.useProgram(P.drop.p); gl.uniform2f(P.drop.u.uRes, W, H);
+        gl.bindVertexArray(dropVao); gl.bindBuffer(gl.ARRAY_BUFFER, dropBuf); gl.bufferSubData(gl.ARRAY_BUFFER, 0, dropData, 0, n * 4);
+        gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, n);
+        gl.disable(gl.BLEND);
+      }
+      // the glass
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, W, H); gl.disable(gl.BLEND);
+      var U = P.disp.u; gl.useProgram(P.disp.p);
+      bindTex(0, state[cur]); bindTex(1, glowB); bindTex(2, bgTex); bindTex(3, bodyTex); bindTex(4, dropTex);
+      gl.uniform1i(U.uState, 0); gl.uniform1i(U.uGlow, 1); gl.uniform1i(U.uBg, 2); gl.uniform1i(U.uBody, 3); gl.uniform1i(U.uDrops, 4);
+      gl.uniformMatrix3fv(U.uHinv, false, hm); gl.uniform2f(U.uRes, W, H);
+      gl.uniform1f(U.uTime, elapsed); gl.uniform1f(U.uRest, Math.min(1, REST_GLOW * wallK)); gl.uniform1f(U.uSpark, SPARKLE * mSpark); gl.uniform1f(U.uLift, mLift);
+      gl.uniform1f(U.uDark, DARK_INSIDE); gl.uniform1f(U.uCity, CITY * wallK); gl.uniform1f(U.uPx, W / 1280); gl.uniform1f(U.uCap, Math.min(1, REST_CAP * wallK));
+      fullscreen();
+      gl.bindVertexArray(null); gl.activeTexture(gl.TEXTURE0);
+    }
+    function frame(dt, now) {
+      if (destroyed) return;
+      dt = Math.max(0, Math.min(0.1, Number.isFinite(dt) ? dt : 0));
+      if (canvas.width !== W || canvas.height !== H) alloc(canvas.width, canvas.height);
+      if (dt > 0) {                          // dt = 0 (a test reading pixels): just draw the picture as it stands
+        elapsed += dt; frames++; nSeg = 0;
+        breath = 0.7 + 0.3 * Math.sin(2 * Math.PI * elapsed / EDGE_PERIOD_S);
+        var folded = body.update(dt, now);
+        syncReg();
+        peopleStep(dt, now);
+        if (body.fresh) freshAt = now;
+        // a blip of stale depth under STALE_HOLD_MS keeps the last maps (no flicker); after that the frost stops being fed
+        if (folded || (!body.fresh && now - freshAt > STALE_HOLD_MS && now - mapsAt > 100)) { bodyMaps(Math.min(0.2, (now - mapsAt) / 1000)); mapsAt = now; }
+        fingersStep(now);
+        tipsStep(dt);
+        seedPeople(dt); seedEdges(dt); musicFrost(dt);
+        gridStep(dt);
+        dropsStep(dt);
+        simPasses(dt);
+      }
+      draw(now);
+    }
+    function destroy() {
+      if (destroyed) return; destroyed = true;
+      if (window.FrostwindowSet === set) delete window.FrostwindowSet;
+      if (window.FrostwindowWake === wake) delete window.FrostwindowWake; kit.wantDepth(false);
+      sized.reverse().forEach(function (r) { gl['delete' + r[0]](r[1]); }); sized = [];
+      made.reverse().forEach(function (r) { gl['delete' + r[0]](r[1]); }); made = [];
+      tips = []; born = []; drops = [];
+      if (window.__frostwindowDebug) try { delete window.__frostwindowDebug; } catch (e) { window.__frostwindowDebug = undefined; }
+    }
+
+    kit.wantDepth(true);
+    alloc(canvas.width, canvas.height);
+    if (window.WallTest) window.__frostwindowDebug = function (box) {   // sandbox only (the live wall has no WallTest)
+      var out = {frames: frames, tips: tips.length, edgeTips: edgeTipN, drops: drops.length, beads: drops.filter(function (d) { return d.bead; }).length,
+                 dropsMade: dropsMade, seedsMade: seedsMade, wipes: wipes, cellPx: +cellPx.toFixed(2), breath: +breath.toFixed(2),
+                 fresh: body.fresh, regOk: body.regOk, foldMs: +body.foldMs.toFixed(2), floatLinear: floatLin, glError: gl.getError(),
+                 people: (body.fresh ? body.people : []).map(function (p, i) { var e = ent[keyIdx[i]];
+                   return {id: p.id, key: keyIdx[i], cx: +p.cx.toFixed(3), area: p.area, still: +p.still.toFixed(2), moving: +p.moving.toFixed(3),
+                           chill: e ? +e.c.toFixed(2) : 0, reach: +reachIdx[i].toFixed(1), tips: ownerTips[keyIdx[i]] || 0}; })};
+      var byOwner = {}, iced = 0;
+      for (var c = 0; c < gN; c++) if (gIce[c] > 0.3) { iced++; var ow = treeOwner[gTree[c]]; ow = ow === undefined ? '?' : ow; byOwner[ow] = (byOwner[ow] || 0) + 1; }
+      out.icedShare = +(iced / gN).toFixed(4); out.icedByOwner = {};
+      Object.keys(byOwner).forEach(function (k) { out.icedByOwner[k] = +(byOwner[k] / gN).toFixed(4); });
+      if (box) {                              // mean ice / wet in a window box [x0, y0, x1, y1] (0..1, y down)
+        var s = 0, w = 0, n = 0, x0 = Math.floor(box[0] * gw), x1 = Math.ceil(box[2] * gw), y0 = Math.floor(box[1] * gh), y1 = Math.ceil(box[3] * gh);
+        var own = {};
+        for (var y = Math.max(0, y0); y < Math.min(gh, y1); y++) for (var x = Math.max(0, x0); x < Math.min(gw, x1); x++) {
+          var cc = y * gw + x; s += gIce[cc]; w += gWet[cc]; n++;
+          if (gIce[cc] > 0.3) { var o2 = treeOwner[gTree[cc]]; o2 = o2 === undefined ? '?' : o2; own[o2] = (own[o2] || 0) + 1; }
+        }
+        Object.keys(own).forEach(function (k) { own[k] = +(own[k] / Math.max(1, n)).toFixed(4); });
+        out.box = {ice: n ? +(s / n).toFixed(4) : 0, wet: n ? +(w / n).toFixed(4) : 0, cells: n, owners: own};
+      }
+      return out;
+    };
+    function set(opts) {
+      if (!opts || destroyed) return {grow: GROW_MAX, ramp: GROW_RAMP_S, wall: wallK};
+      if (typeof opts.wall === 'number' && Number.isFinite(opts.wall)) wallK = Math.max(0.5, Math.min(3, opts.wall));
+      if (Number.isFinite(opts.grow)) GROW_MAX = Math.max(50, Math.min(350, opts.grow));
+      if (Number.isFinite(opts.ramp)) GROW_RAMP_S = Math.max(2, Math.min(20, opts.ramp));
+      return {grow: GROW_MAX, ramp: GROW_RAMP_S, wall: wallK};
+    }
+    function wake(sx, sy, radius, strength) {
+      if (destroyed || !Number.isFinite(sx) || !Number.isFinite(sy)) return;
+      var tips = kit.touches || [];
+      tips.push({id: 'wake', x: sx, y: sy, t: Date.now()});
+      if (tips.length > 8) tips.shift();
+      kit.touches = tips;
+      // Also refresh fingers so frame paths that prefer kit.fingers see the contact.
+      var pts = (kit.fingers && kit.fingers.pts) ? kit.fingers.pts.slice() : [];
+      pts.push([sx, sy]);
+      kit.fingers = {pts: pts, t: Date.now()};
+      if (typeof touch === 'function') try { touch({id: 'wake', x: sx, y: sy, first: true}); } catch (e) {}
+    }
+    window.FrostwindowSet = set;
+    window.FrostwindowWake = wake;
+    if (window._frostwindowFx) set(window._frostwindowFx);
+
+    return {frame: frame, destroy: destroy, resize: function (w, h) { if (!destroyed && (w !== W || h !== H)) alloc(w, h); }};
+  }
+})();

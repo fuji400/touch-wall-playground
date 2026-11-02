@@ -1,0 +1,50 @@
+{
+  "name": "greatwave",
+  "size": [
+    1280,
+    800
+  ],
+  "stride": 9,
+  "vertices": 297000,
+  "groups": [
+    {
+      "pivot": [
+        0,
+        0
+      ],
+      "parent": 0
+    },
+    {
+      "pivot": [
+        0,
+        0
+      ],
+      "parent": 0
+    },
+    {
+      "pivot": [
+        0,
+        0
+      ],
+      "parent": 0
+    },
+    {
+      "pivot": [
+        0,
+        0
+      ],
+      "parent": 0
+    },
+    {
+      "pivot": [
+        0,
+        0
+      ],
+      "parent": 0
+    }
+  ],
+  "counts": {
+    "ribbons": 787
+  },
+  "construction": "authored woodcut forms and foam geometry; reference only"
+}
